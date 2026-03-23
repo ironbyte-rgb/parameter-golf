@@ -1,0 +1,11 @@
+{
+  "author": "ironbyte-rgb",
+  "github_id": "ironbyte-rgb",
+  "name": "HyperSSM-1.58",
+  "blurb": "Selective SSM with hypernetwork weight generation and 1.58-bit ternary quantization. Continuous depth via Euler integration (k=12 train, k=30 eval). Stored params: ~790K, effective params: ~16.6M at eval.",
+  "date": "2026-03-23",
+  "val_loss": 0.0,
+  "val_bpb": 0.0,
+  "bytes_total": 0,
+  "bytes_code": 0
+}
