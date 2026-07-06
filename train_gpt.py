@@ -60,7 +60,7 @@ def get_config():
         "max_seq": 512,
 
         # Training
-        "batch_size": int(os.getenv("BATCH_SIZE", "64")),
+        "batch_size": int(os.getenv("BATCH_SIZE", "1024")),
         "seq_len": int(os.getenv("SEQ_LEN", "512")),
         "lr": float(os.getenv("LR", "6e-3")),
         "weight_decay": 0.1,
@@ -82,6 +82,7 @@ def get_config():
         "dtype": torch.bfloat16,
 
         # Paths
+        "data_dir": os.getenv("DATA_DIR", "./data/tokens"),
         "output_dir": Path(os.getenv("OUTPUT_DIR", "./output")),
         "tokenizer_path": Path("./tokenizer.json"),
     }
@@ -205,11 +206,12 @@ def train(cfg):
         tokenizer=tokenizer,
         seq_len=cfg["seq_len"],
         batch_size=cfg["batch_size"],
-        num_workers=2,
+        data_dir=cfg["data_dir"],
+        num_workers=4,
         prefetch_factor=4,
     )
-    print(f"Batch size: {cfg['batch_size']}, Seq len: {cfg['seq_len']}")
-    print(f"Tokens/step: {cfg['batch_size'] * cfg['seq_len']:,}")
+    print(f"Batch: {cfg['batch_size']}, Seq: {cfg['seq_len']}, "
+          f"Tokens/step: {cfg['batch_size'] * cfg['seq_len']:,}")
 
     # ------------------------------------------------------------------
     # 5. Training

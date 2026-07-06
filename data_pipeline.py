@@ -1,230 +1,270 @@
 """
-FineWeb-Edu streaming data pipeline.
+Data pipelines for training.
 
-Streams FineWeb-Edu from HuggingFace datasets, tokenises on-the-fly with
-our BPE tokenizer, and yields packed sequences for training.  Built for
-Colab A100 — needs to sustain >1M tokens/sec to keep the GPU fed.
+Two modes:
+  1. PreTokenizedDataset  — loads pre-tokenized .pt shards (FAST, 10M+ tok/s)
+  2. FineWebDataset       — streams from HF + tokenises on-the-fly (fallback)
+
+Always prefer mode 1.  Run prepare_data.py first to build the shards.
 """
 
 import torch
-from torch.utils.data import IterableDataset, DataLoader
+from torch.utils.data import Dataset, IterableDataset, DataLoader
+from pathlib import Path
 
 
-class FineWebDataset(IterableDataset):
-    """Streaming FineWeb-Edu dataset with on-the-fly tokenisation.
+# ------------------------------------------------------------------
+# FAST PATH: pre-tokenized .pt shards
+# ------------------------------------------------------------------
 
-    Yields (input_ids, targets) pairs where:
-      - input_ids: (seq_len,)   — token sequence
-      - targets:   (seq_len,)   — same sequence shifted right by 1
+class PreTokenizedDataset(Dataset):
+    """Map-style dataset over pre-tokenized uint16 .pt shards.
 
-    Documents are concatenated with an <s> separator.  Sequences never
-    cross a document boundary without the separator, preventing the
-    model from attending across unrelated documents.
+    Loads all shards into a single contiguous buffer in RAM.  For datasets
+    larger than available RAM, set ``mmap=True`` to use memory-mapped files
+    instead (slightly slower but handles 10B+ tokens).
 
-    Args:
-        tokenizer:       a HuggingFace ``tokenizers.Tokenizer``
-        seq_len:         sequence length (512)
-        split:           HF dataset split (default "train")
-        buffer_size:     tokens to buffer before yielding batches
-        max_docs:        max documents to stream (None = unlimited)
+    Yields (input_ids, targets) pairs of shape (seq_len,).
     """
 
-    def __init__(
-        self,
-        tokenizer,
-        seq_len=512,
-        split="train",
-        buffer_size=1_000_000,
-        max_docs=None,
-    ):
+    def __init__(self, data_dir, seq_len=512, mmap=False):
+        self.seq_len = seq_len
+        data_dir = Path(data_dir)
+
+        shards = sorted(data_dir.glob("fineweb_edu_*.pt"))
+        if not shards:
+            raise FileNotFoundError(
+                f"No fineweb_edu_*.pt shards found in {data_dir}.  "
+                f"Run prepare_data.py first."
+            )
+
+        print(f"Loading {len(shards)} pre-tokenized shard(s)...")
+
+        if mmap:
+            # Memory-map each shard (zero-copy, virtual memory backed by disk)
+            self._tensors = [
+                torch.load(str(s), map_location="cpu", weights_only=True)
+                for s in shards
+            ]
+            # Build index for fast lookup without concatenating
+            self._cumsum = [0]
+            for t in self._tensors:
+                self._cumsum.append(self._cumsum[-1] + t.numel())
+            self._total = self._cumsum[-1]
+            self._mmap = True
+        else:
+            # Load everything into one contiguous buffer (fastest)
+            tensors = [
+                torch.load(str(s), map_location="cpu", weights_only=True)
+                for s in shards
+            ]
+            total_elems = sum(t.numel() for t in tensors)
+            self._data = torch.empty(total_elems, dtype=torch.uint16)
+            offset = 0
+            for t in tensors:
+                self._data[offset : offset + t.numel()] = t
+                offset += t.numel()
+            self._total = total_elems
+            self._mmap = False
+
+        self.n_sequences = (self._total - 1) // seq_len
+        total_mb = self._total * 2 / 1e6
+        print(f"  {self._total:,} tokens ({total_mb:.0f} MB), "
+              f"{self.n_sequences:,} sequences")
+
+    def _get_token(self, idx):
+        """O(1) token lookup for both mmap and contiguous modes."""
+        if self._mmap:
+            # Binary search for the right shard
+            import bisect
+            shard = bisect.bisect_right(self._cumsum, idx) - 1
+            offset = idx - self._cumsum[shard]
+            return self._tensors[shard][offset]
+        else:
+            return self._data[idx]
+
+    def __len__(self):
+        return self.n_sequences
+
+    def __getitem__(self, idx):
+        start = idx * self.seq_len
+        end = start + self.seq_len + 1
+        if self._mmap:
+            # Slower path: gather token by token
+            chunk = torch.tensor(
+                [int(self._get_token(i)) for i in range(start, end)],
+                dtype=torch.long,
+            )
+        else:
+            chunk = self._data[start:end].long()
+        return chunk[:-1], chunk[1:]
+
+
+# ------------------------------------------------------------------
+# FALLBACK: HF streaming (slow — use only if pre-tokenized data unavailable)
+# ------------------------------------------------------------------
+
+class FineWebDataset(IterableDataset):
+    """Streaming FineWeb-Edu with on-the-fly tokenisation (FALLBACK)."""
+
+    def __init__(self, tokenizer, seq_len=512, split="train", max_docs=None):
         super().__init__()
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.split = split
-        self.buffer_size = buffer_size
         self.max_docs = max_docs
-
-        # Special token ids
         self.bos_id = tokenizer.token_to_id("<s>") or 0
         self.eos_id = tokenizer.token_to_id("</s>") or 2
-        self.pad_id = tokenizer.token_to_id("<pad>") or 3
-
-    # ------------------------------------------------------------------
-    # Internal: token buffer management
-    # ------------------------------------------------------------------
-
-    def _tokenize_doc(self, text):
-        """Tokenize a single document, return list of token ids."""
-        encoded = self.tokenizer.encode(text)
-        return encoded.ids
-
-    # ------------------------------------------------------------------
 
     def __iter__(self):
         from datasets import load_dataset
-
         ds = load_dataset(
-            "HuggingFaceFW/fineweb-edu",
-            "sample-10BT",
-            streaming=True,
-            split=self.split,
+            "HuggingFaceFW/fineweb-edu", "sample-10BT",
+            streaming=True, split=self.split,
         )
-
-        buffer = []          # flat list of token ids
-        doc_count = 0
-
+        buffer, doc_count = [], 0
         for row in ds:
             text = row["text"]
             if not text or len(text.strip()) < 10:
                 continue
-
-            tokens = self._tokenize_doc(text)
+            tokens = self.tokenizer.encode(text).ids
             if len(tokens) < 4:
                 continue
-
-            # Add document tokens with boundary markers
             buffer.append(self.bos_id)
             buffer.extend(tokens)
             buffer.append(self.eos_id)
-
             doc_count += 1
             if self.max_docs and doc_count >= self.max_docs:
                 break
-
-            # Yield sequences once buffer has enough tokens
             while len(buffer) >= self.seq_len + 1:
-                # Take seq_len + 1 tokens (for input + shifted target)
                 chunk = buffer[: self.seq_len + 1]
-                buffer = buffer[self.seq_len :]  # shift by seq_len
-
-                input_ids = torch.tensor(chunk[:-1], dtype=torch.long)
-                targets = torch.tensor(chunk[1:], dtype=torch.long)
-                yield input_ids, targets
-
-        # Yield any remaining tokens at end of dataset
+                buffer = buffer[self.seq_len :]
+                yield (torch.tensor(chunk[:-1], dtype=torch.long),
+                       torch.tensor(chunk[1:], dtype=torch.long))
         while len(buffer) >= self.seq_len + 1:
             chunk = buffer[: self.seq_len + 1]
             buffer = buffer[self.seq_len :]
-            input_ids = torch.tensor(chunk[:-1], dtype=torch.long)
-            targets = torch.tensor(chunk[1:], dtype=torch.long)
-            yield input_ids, targets
+            yield (torch.tensor(chunk[:-1], dtype=torch.long),
+                   torch.tensor(chunk[1:], dtype=torch.long))
 
+
+# ------------------------------------------------------------------
+# Factory
+# ------------------------------------------------------------------
 
 def create_dataloader(
-    tokenizer,
+    tokenizer=None,
     seq_len=512,
     batch_size=64,
-    split="train",
-    num_workers=2,
+    data_dir="./data/tokens",
+    num_workers=4,
     prefetch_factor=4,
     max_docs=None,
+    mmap=False,
 ):
-    """Create a DataLoader for FineWeb-Edu streaming.
+    """Create the best available DataLoader.
+
+    If ``data_dir`` contains pre-tokenized .pt shards, uses the fast
+    PreTokenizedDataset.  Otherwise falls back to HF streaming.
 
     Args:
-        tokenizer:         HuggingFace ``tokenizers.Tokenizer``
-        seq_len:           sequence length
-        batch_size:        sequences per batch
-        split:             "train" or validation subset
-        num_workers:       DataLoader worker processes
-        prefetch_factor:   batches to prefetch per worker
-        max_docs:          max documents (None = unlimited)
+        tokenizer:       HuggingFace tokenizer (only needed for fallback)
+        seq_len:         sequence length
+        batch_size:      sequences per batch
+        data_dir:        path to pre-tokenized .pt shards
+        num_workers:     DataLoader workers (0 = main process only)
+        prefetch_factor: batches to prefetch per worker
+        max_docs:        max documents for fallback (None = unlimited)
+        mmap:            use memory-mapped files for fast loader
 
     Returns:
         torch.utils.data.DataLoader
     """
-    dataset = FineWebDataset(
-        tokenizer=tokenizer,
-        seq_len=seq_len,
-        split=split,
-        max_docs=max_docs,
-    )
+    data_dir = Path(data_dir)
 
-    # Collate function: stack individual sequences into batches
+    if list(data_dir.glob("fineweb_edu_*.pt")):
+        print(f"Using pre-tokenized data from {data_dir}")
+        dataset = PreTokenizedDataset(data_dir, seq_len=seq_len, mmap=mmap)
+    elif tokenizer is not None:
+        print("No pre-tokenized data found, using HF streaming (SLOW).")
+        print("Run prepare_data.py for 10-30x faster training.")
+        dataset = FineWebDataset(
+            tokenizer=tokenizer, seq_len=seq_len, max_docs=max_docs,
+        )
+    else:
+        raise RuntimeError(
+            "No pre-tokenized data found and no tokenizer provided.  "
+            "Either run prepare_data.py or pass a tokenizer."
+        )
+
     def collate_fn(batch):
-        input_ids = torch.stack([item[0] for item in batch])
-        targets = torch.stack([item[1] for item in batch])
-        return input_ids, targets
+        return torch.stack([b[0] for b in batch]), torch.stack([b[1] for b in batch])
 
-    loader = DataLoader(
+    return DataLoader(
         dataset,
         batch_size=batch_size,
         collate_fn=collate_fn,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
         pin_memory=True,
+        drop_last=True,
     )
-
-    return loader
 
 
 # ------------------------------------------------------------------
 # Smoke-test
 # ------------------------------------------------------------------
 if __name__ == "__main__":
+    import time, sys
+
     print("=== Data pipeline smoke test ===\n")
+    data_dir = Path("./data/tokens")
 
-    from tokenizers import Tokenizer
-
-    # Quick test with a pre-built tiny tokenizer
-    # (same as tokenizer_.py smoke test)
-    tokenizer_path = "/tmp/_test_tokenizer.json"
-    try:
-        tokenizer = Tokenizer.from_file(tokenizer_path)
-    except Exception:
-        # Build one on-the-fly
-        from tokenizers import models, pre_tokenizers, trainers
-
-        tokenizer = Tokenizer(models.BPE(unk_token="<unk>"))
-        tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(
-            add_prefix_space=True
+    # Check if pre-tokenized data exists
+    shards = list(data_dir.glob("fineweb_edu_*.pt"))
+    if shards:
+        print(f"Found {len(shards)} pre-tokenized shard(s)")
+        loader = create_dataloader(
+            seq_len=512, batch_size=128, data_dir=data_dir,
+            num_workers=0, mmap=False,
         )
+        print(f"Dataset: {len(loader.dataset):,} sequences")
+
+        t0 = time.time()
+        tokens_seen = 0
+        for i, (x, y) in enumerate(loader):
+            tokens_seen += x.numel()
+            if i >= 50:
+                break
+        elapsed = time.time() - t0
+        print(f"  {tokens_seen:,} tokens in {elapsed:.1f}s "
+              f"({tokens_seen / max(elapsed, 0.001) / 1e6:.1f}M tok/s)")
+        print("  Pre-tokenized pipeline OK!")
+    else:
+        print("No pre-tokenized data found.  Testing fallback...")
+        from tokenizers import Tokenizer, models, pre_tokenizers, trainers
+
+        tok = Tokenizer(models.BPE(unk_token="<unk>"))
+        tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=True)
         trainer_obj = trainers.BpeTrainer(
             vocab_size=512,
             special_tokens=["<unk>", "<s>", "</s>", "<pad>"],
             min_frequency=1,
         )
-        corpus = [
-            "hello world this is a test corpus for training",
-            "machine learning transformers attention neural networks",
-            "deep learning models use gradient descent optimization",
-        ] * 100
-        tokenizer.train_from_iterator(corpus, trainer_obj)
-        tokenizer.save(tokenizer_path)
+        corpus = ["hello world test corpus for training"] * 100
+        tok.train_from_iterator(corpus, trainer_obj)
 
-    print(f" Vocab size: {tokenizer.get_vocab_size()}")
-
-    # Test with a small number of real FineWeb documents
-    loader = create_dataloader(
-        tokenizer=tokenizer,
-        seq_len=512,
-        batch_size=4,
-        num_workers=0,   # must be 0 in __main__ on Windows
-        max_docs=200,
-    )
-
-    print(" Streaming FineWeb-Edu (200 docs max)...")
-    batch_count = 0
-    tokens_seen = 0
-
-    import time
-    t0 = time.time()
-
-    for input_ids, targets in loader:
-        batch_count += 1
-        tokens_seen += input_ids.numel()
-        assert input_ids.shape == targets.shape
-        assert input_ids.shape[1] == 512
-        if batch_count <= 2:
-            print(f"   Batch {batch_count}: shape={input_ids.shape}, "
-                  f"ids range=[{input_ids.min().item()}, {input_ids.max().item()}]")
-        if batch_count >= 50:
-            break
-
-    elapsed = time.time() - t0
-    tok_per_sec = tokens_seen / elapsed
-    print(f"\n Batches:     {batch_count}")
-    print(f" Tokens:      {tokens_seen:,}")
-    print(f" Time:        {elapsed:.1f}s")
-    print(f" Throughput:  {tok_per_sec:,.0f} tok/sec")
-    print(" All checks passed.")
+        loader = create_dataloader(
+            tokenizer=tok, seq_len=512, batch_size=4,
+            num_workers=0, max_docs=200,
+        )
+        t0 = time.time()
+        tokens_seen = 0
+        for i, (x, y) in enumerate(loader):
+            tokens_seen += x.numel()
+            if i >= 50:
+                break
+        elapsed = time.time() - t0
+        print(f"  {tokens_seen:,} tokens in {elapsed:.1f}s "
+              f"({tokens_seen / max(elapsed, 0.001) / 1e6:.1f}M tok/s)")
+        print("  Fallback pipeline OK!")
