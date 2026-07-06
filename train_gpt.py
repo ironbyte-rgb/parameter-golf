@@ -164,6 +164,7 @@ def train(cfg):
     model_size_mb = total * 2 / 1e6
     print(f"Parameters: {total:,}  ({model_size_mb:.2f} MB at BF16)")
 
+    model_raw = model  # keep uncompiled ref for roundtrip validation
     if cfg["compile_model"] and device.type == "cuda":
         print("Compiling model with torch.compile (reduce-overhead)...")
         model = torch.compile(model, mode="reduce-overhead")
@@ -308,16 +309,17 @@ def train(cfg):
     best_ckpt = output_dir / "best_model.pt"
     if best_ckpt.exists():
         print(f"Loading best checkpoint: {best_ckpt}")
-        model.load_state_dict(torch.load(best_ckpt, map_location=device))
+        model_raw.load_state_dict(torch.load(best_ckpt, map_location=device))
 
+    eval_model = model_raw  # use uncompiled for reliable weight loading
     val_loss, val_bpb = run_eval(
-        model, tokenizer, luts, device, cfg, sliding=False
+        eval_model, tokenizer, luts, device, cfg, sliding=False
     )
     print(f"\nFinal val_loss: {val_loss:.4f}")
     print(f"Final val_bpb:  {val_bpb:.4f}")
 
     sw_loss, sw_bpb = run_eval(
-        model, tokenizer, luts, device, cfg, sliding=True
+        eval_model, tokenizer, luts, device, cfg, sliding=True
     )
     print(f"Sliding-window val_bpb (stride={cfg['sliding_window_stride']}): {sw_bpb:.4f}")
 
@@ -332,10 +334,11 @@ def train(cfg):
 
     print("\nRoundtrip validation...")
     dequant_sd = load_and_dequantize(ptz_path)
-    model.load_state_dict(dequant_sd, strict=True)
+    # Must use uncompiled model — torch.compile caches weights in the graph
+    model_raw.load_state_dict(dequant_sd, strict=True)
 
     rt_loss, rt_bpb = run_eval(
-        model, tokenizer, luts, device, cfg, sliding=False
+        model_raw, tokenizer, luts, device, cfg, sliding=False
     )
     print(f"Roundtrip val_loss: {rt_loss:.4f}")
     print(f"Roundtrip val_bpb:  {rt_bpb:.4f}")
