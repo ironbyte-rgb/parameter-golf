@@ -113,8 +113,11 @@ class FineWebDataset(IterableDataset):
         self.seq_len = seq_len
         self.split = split
         self.max_docs = max_docs
-        self.bos_id = tokenizer.token_to_id("<s>") or 0
-        self.eos_id = tokenizer.token_to_id("</s>") or 2
+        # Support both custom BPE (<s>/</s>) and GPT-2 (<|endoftext|>)
+        self.bos_id = (tokenizer.token_to_id("<s>")
+                       or tokenizer.token_to_id("<|endoftext|>") or 0)
+        self.eos_id = (tokenizer.token_to_id("</s>")
+                       or tokenizer.token_to_id("<|endoftext|>") or 2)
 
     def __iter__(self):
         from datasets import load_dataset

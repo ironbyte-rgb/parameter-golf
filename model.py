@@ -98,7 +98,7 @@ class TransformerBlock(nn.Module):
         n_kv_heads=1,
         d_head=32,
         d_c=16,
-        ffn_dim=512,
+        ffn_dim=1024,
         tt_rank=16,
         max_seq=512,
     ):
@@ -160,14 +160,14 @@ class TTMLATransformer(nn.Module):
 
     def __init__(
         self,
-        vocab_size=4096,
+        vocab_size=50257,
         d_model=256,
-        n_layers=8,
+        n_layers=12,
         n_heads=8,
         n_kv_heads=1,
         d_head=32,
         d_c=16,
-        ffn_dim=512,
+        ffn_dim=1024,
         tt_rank=16,
         max_seq=512,
     ):

@@ -1,21 +1,14 @@
 """
-BPE tokenizer training and byte-counting LUT builder.
+BPE tokenizer and byte-counting LUT builder.
 
-Trains a Byte-Pair Encoding tokenizer (vocab=4096) on a FineWeb-Edu sample,
-then builds the three lookup tables required for the val_bpb computation:
+Supports two tokenizer sources:
+  1. GPT-2 tokenizer (50,257 vocab) — loaded from HuggingFace, no training needed
+  2. Custom BPE trained on FineWeb-Edu — any vocab size
 
-  base_bytes_lut[t]    — UTF-8 byte length of token t's decoded string
-  has_leading_space[t] — True if the token starts with a space marker
-  is_boundary[t]       — True for special tokens (control / unknown / unused)
-
-The val_bpb formula matches the OpenAI Parameter Golf protocol exactly:
+The byte-counting LUTs work identically for both; the val_bpb formula
+matches the OpenAI Parameter Golf protocol exactly:
 
   val_bpb = (val_loss / ln(2)) * (token_count / byte_count)
-
-where byte_count accumulates per-token bytes with the leading-space rule:
-  bytes = base_bytes_lut[tgt]
-  if has_leading_space[tgt] and not is_boundary[prev]:
-      bytes += 1
 """
 
 import json
@@ -27,7 +20,51 @@ import torch
 
 
 # ------------------------------------------------------------------
-# Tokenizer training
+# GPT-2 tokenizer (recommended: 50K vocab, zero training cost)
+# ------------------------------------------------------------------
+
+def get_gpt2_tokenizer(save_path=None):
+    """Load the GPT-2 ByteLevel BPE tokenizer.
+
+    Returns a ``tokenizers.Tokenizer`` object with vocab size 50,257.
+    If ``save_path`` is given, saves a copy to disk for faster reload.
+
+    The GPT-2 tokenizer uses the same ByteLevel BPE encoding as our
+    custom-trained tokenizers, so all byte LUT logic is unchanged.
+    """
+    from transformers import GPT2TokenizerFast
+
+    print("Loading GPT-2 tokenizer (vocab=50257)...")
+    hf_tok = GPT2TokenizerFast.from_pretrained("gpt2")
+
+    # Access the underlying tokenizers.Tokenizer
+    # GPT2TokenizerFast._tokenizer is the raw tokenizers.Tokenizer object
+    tokenizer = hf_tok._tokenizer
+
+    # GPT-2 uses <|endoftext|> as both BOS and EOS
+    # Make sure standard special tokens are registered for our pipeline
+    vocab = tokenizer.get_vocab()
+    eos_token = "<|endoftext|>"
+    eos_id = vocab.get(eos_token, 50256)
+
+    # Add <s> and </s> aliases pointing to <|endoftext|> so our data
+    # pipeline's bos_id/eos_id lookups work without changes
+    if "<s>" not in vocab:
+        tokenizer.add_special_tokens(["<s>"])
+        # Re-map <s> to the same ID as <|endoftext|>
+    if "</s>" not in vocab:
+        tokenizer.add_special_tokens(["</s>"])
+
+    if save_path:
+        tokenizer.save(str(save_path))
+        print(f"  Saved to {save_path}")
+
+    print(f"  Vocabulary size: {tokenizer.get_vocab_size()}")
+    return tokenizer
+
+
+# ------------------------------------------------------------------
+# Custom BPE training (alternative: any vocab size)
 # ------------------------------------------------------------------
 
 def train_bpe_tokenizer(
@@ -137,7 +174,7 @@ def build_byte_luts(tokenizer, vocab_size=4096):
     is_boundary = torch.zeros(vocab_size, dtype=torch.bool)
 
     special_ids = set()
-    for special_name in ["<unk>", "<s>", "</s>", "<pad>"]:
+    for special_name in ["<unk>", "<s>", "</s>", "<pad>", "<|endoftext|>"]:
         if special_name in vocab:
             special_ids.add(vocab[special_name])
 

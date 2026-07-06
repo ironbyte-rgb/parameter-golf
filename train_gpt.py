@@ -34,7 +34,7 @@ import torch.nn.functional as F
 
 # Local modules
 from model import TTMLATransformer
-from tokenizer_ import train_bpe_tokenizer, build_byte_luts
+from tokenizer_ import train_bpe_tokenizer, build_byte_luts, get_gpt2_tokenizer
 from data_pipeline import create_dataloader
 from eval import evaluate_model, evaluate_sliding_window, load_validation_tokens
 from quantize import save_compressed_model, load_and_dequantize
@@ -48,14 +48,14 @@ def get_config():
     """Build config from environment variables with sensible defaults."""
     return {
         # Model
-        "vocab_size": 4096,
+        "vocab_size": 50257,
         "d_model": 256,
-        "n_layers": 8,
+        "n_layers": 12,
         "n_heads": 8,
         "n_kv_heads": 1,
         "d_head": 32,
         "d_c": 16,
-        "ffn_dim": 512,
+        "ffn_dim": 1024,
         "tt_rank": 16,
         "max_seq": 512,
 
@@ -134,10 +134,8 @@ def train(cfg):
         from tokenizers import Tokenizer
         tokenizer = Tokenizer.from_file(str(tokenizer_path))
     else:
-        tokenizer = train_bpe_tokenizer(
-            output_path=tokenizer_path,
-            vocab_size=cfg["vocab_size"],
-        )
+        # Default: GPT-2 tokenizer (50K vocab, zero training cost)
+        tokenizer = get_gpt2_tokenizer(save_path=tokenizer_path)
 
     actual_vocab = tokenizer.get_vocab_size()
     print(f"Vocabulary size: {actual_vocab}")
