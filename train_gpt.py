@@ -49,13 +49,13 @@ def get_config():
     return {
         # Model
         "vocab_size": 50257,
-        "d_model": 256,
-        "n_layers": 12,
+        "d_model": 400,
+        "n_layers": 16,
         "n_heads": 8,
         "n_kv_heads": 1,
-        "d_head": 32,
+        "d_head": 50,
         "d_c": 16,
-        "ffn_dim": 1024,
+        "ffn_dim": 1536,
         "tt_rank": 16,
         "max_seq": 512,
 
